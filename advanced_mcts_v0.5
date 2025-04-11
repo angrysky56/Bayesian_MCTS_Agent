@@ -1,0 +1,843 @@
+"""
+title: advanced_mcts
+author: angrysky56
+author_url: https://github.com/angrysky56
+description: Advanced Monte Carlo Tree Search with strategic memory and JSON export (Visualization Removed)
+version: 0.5.0
+
+Key improvements in v0.5.0:
+- Removed Mermaid diagram generation and related output to avoid rendering issues.
+- Kept JSON export for external visualization/analysis.
+- Kept reintegrated sophisticated approach classification & surprise detection.
+- Kept robust None checks and defaults for LLM outputs & error handling.
+- Kept enhanced exploration logic.
+- Kept high default exploration parameters.
+"""
+
+from fastapi import Request
+import logging
+import random
+import math
+import asyncio
+import json
+import re
+import numpy as np
+from scipy import stats
+from sklearn.metrics.pairwise import cosine_similarity
+from typing import (
+    List,
+    Optional,
+    AsyncGenerator,
+    Callable,
+    Awaitable,
+    Generator,
+    Iterator,
+    Dict,
+    Any,
+    Tuple,
+    Set,
+)
+from pydantic import BaseModel, Field
+from open_webui.constants import TASKS
+import open_webui.routers.ollama as ollama
+from open_webui.main import app
+
+# ==============================================================================
+
+name = "advanced_mcts"
+
+# Configurable parameters with defaults set for robust exploration
+config = {
+    "max_children": 4,
+    "exploration_weight": 2.5,
+    "max_iterations": 3,
+    "simulations_per_iteration": 15,
+    "thoughts_per_node": 2, # Legacy
+    "surprise_threshold": 0.65,
+    "use_semantic_distance": True,
+    "use_llm_embedding_for_distance": False, # Future enhancement
+    # "node_label_length": 100, # Removed as Mermaid is gone
+    "relative_evaluation": False, # Defaulting to absolute eval
+    "score_diversity_bonus": 0.7,
+    "force_exploration_interval": 4, # Interval for non-leaf selection
+    "debug_logging": True, # Enable detailed logging
+    "global_context_in_prompts": True,
+    "track_explored_approaches": True,
+    "sibling_awareness": True,
+    "memory_cutoff": 5,
+    "early_stopping": True,
+    "early_stopping_threshold": 9.0,
+    "early_stopping_stability": 3,
+    # Surprise Detection Weights
+    "surprise_semantic_weight": 0.5,
+    "surprise_philosophical_shift_weight": 0.3,
+    "surprise_novelty_weight": 0.2,
+    "surprise_overall_threshold": 0.7,
+}
+
+# ==============================================================================
+# --- Approach Taxonomy & Metadata ---
+approach_taxonomy = {
+    "empirical": ["evidence", "data", "observation", "experiment"], "rational": ["logic", "reason", "deduction", "principle"],
+    "phenomenological": ["experience", "perception", "consciousness"], "hermeneutic": ["interpret", "meaning", "context", "understanding"],
+    "reductionist": ["reduce", "component", "fundamental", "elemental"], "holistic": ["whole", "system", "emergent", "interconnected"],
+    "materialist": ["physical", "concrete", "mechanism"], "idealist": ["concept", "ideal", "abstract", "mental"],
+    "analytical": ["analyze", "dissect", "examine", "scrutinize"], "synthetic": ["synthesize", "integrate", "combine", "unify"],
+    "dialectical": ["thesis", "antithesis", "contradiction"], "comparative": ["compare", "contrast", "analogy"],
+    "critical": ["critique", "challenge", "question", "flaw"], "constructive": ["build", "develop", "formulate"],
+    "pragmatic": ["practical", "useful", "effective"], "normative": ["should", "ought", "value", "ethical"],
+    "structural": ["structure", "organize", "framework"], "alternative": ["alternative", "different", "another way"],
+    "complementary": ["missing", "supplement", "add"],
+}
+approach_metadata = {
+    "empirical": {"family": "epistemology"}, "rational": {"family": "epistemology"}, "phenomenological": {"family": "epistemology"}, "hermeneutic": {"family": "epistemology"},
+    "reductionist": {"family": "ontology"}, "holistic": {"family": "ontology"}, "materialist": {"family": "ontology"}, "idealist": {"family": "ontology"},
+    "analytical": {"family": "methodology"}, "synthetic": {"family": "methodology"}, "dialectical": {"family": "methodology"}, "comparative": {"family": "methodology"},
+    "critical": {"family": "perspective"}, "constructive": {"family": "perspective"}, "pragmatic": {"family": "perspective"}, "normative": {"family": "perspective"},
+    "structural": {"family": "general"}, "alternative": {"family": "general"}, "complementary": {"family": "general"},
+    "variant": {"family": "general"}, "initial": {"family": "general"},
+}
+# ==============================================================================
+
+# Prompt templates (Shortened for brevity, ensure full versions are used if needed)
+thoughts_prompt = """<instruction>Generate thought...</instruction><context>STATUS: - Best (score: {best_score}/10): {best_answer} - Explored: {explored_approaches} - Current type: {current_approach} - Draft: {answer}</context><question>{question}</question>Suggest SIGNIFICANTLY DIFFERENT APPROACH or MAJOR WEAKNESS..."""
+relative_eval_prompt = """<instruction>Compare new to previous answer, rate IMPROVEMENT (1-5)...</instruction><context>STATUS: - Best (score: {best_score}/10): {best_answer}</context><question>{question}</question><previous_answer>{parent_answer}</previous_answer><new_answer>{answer}</new_answer>Rate IMPROVEMENT (1-5)... Reply single number 1-5."""
+eval_answer_prompt = """<instruction>Evaluate answer critically (1-10)...</instruction><context>STATUS: - Best (score: {best_score}/10): {best_answer}</context><question>{question}</question><answer_to_evaluate>{answer}</answer_to_evaluate>Rate 1-10. Be STRICT... Reply single number 1-10 only."""
+analyze_prompt = """<instruction>Analyze MCTS iteration.</instruction><context>STATS: - Q: {question} - Best: {best_answer} (Score: {best_score}) - Depth: {tree_depth} - Branches: {branches} - Approaches: {approach_types}</context>Analyze: 1.Best answer success? 2.High-score patterns? 3.Low-score pitfalls? 4.Improve thought gen? 5.Unexplored? Provide concise analysis & ONE improvement strategy."""
+update_prompt = """<instruction>Refine answer based on critique & context.</instruction><context>STATUS: - Best (score: {best_score}/10): {best_answer} - Explored: {explored_approaches} - Current: {current_approach}</context><question>{question}</question><draft>{answer}</draft><critique>{improvements}</critique>Critique suggests DIFFERENT APPROACH/MAJOR WEAKNESS. Rethink... WRITE SUBSTANTIALLY REVISED ANSWER..."""
+initial_prompt = """<instruction>Answer the question below.</instruction><question>{question}</question>"""
+embedding_prompt = """<instruction>Create compact semantic embedding description...</instruction><text>{text}</text>"""
+final_summary_prompt = """<instruction>Create comprehensive final summary of MCTS.</instruction><context>STATS: - Q: {question} - Best Answer (score: {best_score}/10): {best_answer} - Iters: {iterations} - Nodes: {total_nodes} - Depth: {tree_depth} - Approaches: {approach_count} - Best Approach: {best_approach} (avg score: {best_approach_score})</context>Write final report: 1.Overview. 2.Best answer/success. 3.Insights. 4.Alternatives. 5.Conclusion."""
+
+# ==============================================================================
+
+# Logger Setup Function
+def setup_logger():
+    logger = logging.getLogger(__name__)
+    log_level = logging.DEBUG if config.get("debug_logging", True) else logging.INFO
+    logger.setLevel(log_level)
+    if not any(handler.get_name() == name for handler in logger.handlers):
+        handler = logging.StreamHandler(); handler.set_name(name)
+        formatter = logging.Formatter("%(asctime)s - %(name)s [%(levelname)s] %(message)s")
+        handler.setFormatter(formatter); logger.addHandler(handler); logger.propagate = False
+    for handler in logger.handlers: handler.setLevel(log_level)
+    return logger
+logger = setup_logger()
+
+# Admin User Mock
+class AdminUserMock:
+    def __init__(self): self.role = "admin"
+admin = AdminUserMock()
+
+# ==============================================================================
+
+# Text processing functions
+def truncate_text(text, max_length=200): # Use a default length suitable for JSON/logs
+    if not text: return ""
+    text = str(text)
+    # No need for node_label_length config anymore
+    # max_length = max_length if max_length is not None else config["node_label_length"]
+    text = text.replace("\n", " ").strip()
+    return text if len(text) <= max_length else text[:max_length] + "..."
+
+# Removed escape_mermaid as it's no longer needed
+
+def calculate_semantic_distance(text1, text2, llm=None):
+    # (Robust version from v0.3.2/v0.4.0)
+    if not text1 or not text2: return 1.0
+    text1, text2 = str(text1), str(text2)
+    # LLM embedding placeholder...
+    from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+    from sklearn.metrics.pairwise import cosine_similarity
+    vectorizer = TfidfVectorizer(stop_words=list(ENGLISH_STOP_WORDS))
+    try:
+        tfidf_matrix = vectorizer.fit_transform([text1, text2])
+        if tfidf_matrix.shape[0] < 2 or tfidf_matrix.shape[1] == 0: raise ValueError("TF-IDF matrix issue.")
+        similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+        similarity = max(0.0, min(1.0, similarity)); return 1.0 - similarity
+    except Exception as e:
+        logger.warning(f"TF-IDF semantic distance error: {e}. Falling back to Jaccard.")
+        words1 = set(re.findall(r'\w+', text1.lower())); words2 = set(re.findall(r'\w+', text2.lower()))
+        if not words1 or not words2: return 1.0
+        intersection = len(words1.intersection(words2)); union = len(words1.union(words2))
+        if union == 0: return 0.0
+        jaccard_similarity = intersection / union; return 1.0 - jaccard_similarity
+
+# ==============================================================================
+
+class Node:
+    """A node in the Monte Carlo Tree Search."""
+    def __init__(self, **kwargs):
+        # (Robust init from v0.3.2/v0.4.0)
+        self.id = "node_" + "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=4))
+        self.content = str(kwargs.get("content", ""))
+        self.parent = kwargs.get("parent")
+        self.exploration_weight = config["exploration_weight"]
+        self.max_children = config["max_children"]
+        self.children = []
+        self.visits = 0; self.value = 0.0; self.raw_scores = []
+        self.sequence = kwargs.get("sequence", 0); self.embedding = ""
+        self.is_surprising = kwargs.get("is_surprising", False)
+        self.surprise_explanation = str(kwargs.get("surprise_explanation", ""))
+        self.approach_type = str(kwargs.get("approach_type", "initial"))
+        self.approach_family = str(kwargs.get("approach_family", "general"))
+        self.thought = str(kwargs.get("thought", ""))
+        self.generation_context = kwargs.get("generation_context", {})
+        if self.is_surprising: self.value = 2.0
+
+    def add_child(self, child: "Node"): child.parent = self; self.children.append(child); return child
+    def fully_expanded(self): return len(self.children) >= self.max_children
+
+    def uct_value(self):
+        # (Robust UCT from v0.3.2/v0.4.0)
+        epsilon = 1e-6; parent_visits = self.parent.visits if self.parent else 1
+        if self.visits == 0: return float("inf")
+        exploitation = self.value / self.visits
+        exploration = self.exploration_weight * math.sqrt(math.log(parent_visits + epsilon) / self.visits)
+        surprise_bonus = 0.3 if self.is_surprising else 0; diversity_bonus = 0.0
+        if self.parent and len(self.parent.children) > 1 and config["score_diversity_bonus"] > 0:
+            sibling_scores = [c.value / max(1, c.visits) for c in self.parent.children if c != self and c.visits > 0]
+            if sibling_scores:
+                sibling_avg = sum(sibling_scores) / len(sibling_scores); my_avg = self.value / self.visits
+                diversity_bonus = config["score_diversity_bonus"] * abs(my_avg - sibling_avg)
+        return exploitation + exploration + surprise_bonus + diversity_bonus
+
+    # Removed Node.mermaid method
+
+    def best_child(self):
+        if not self.children: return self
+        return max(self.children, key=lambda child: (child.visits, child.value / max(1, child.visits)))
+
+    def node_to_json(self):
+        # Output FULL content in JSON, use truncate_text for display elsewhere if needed
+        return {
+            "id": self.id, "sequence": self.sequence, "content": self.content, # Keep full content
+            "visits": self.visits, "value": round(self.value, 2), "score": round(self.value / max(1, self.visits), 2),
+            "approach_type": self.approach_type, "approach_family": self.approach_family,
+            "is_surprising": self.is_surprising,
+            "thought": self.thought, # Keep full thought
+            "children": [child.node_to_json() for child in self.children]
+        }
+
+# ==============================================================================
+
+class MCTS:
+    """Monte Carlo Tree Search implementation with strategic memory."""
+    def __init__(self, **kwargs):
+        # (Using robust init from v0.3.2/v0.4.0)
+        self.question = kwargs.get("question")
+        self.root = kwargs.get("root")
+        self.node_sequence = 0
+        self.root.sequence = self.get_next_sequence()
+        self.llm = kwargs.get("llm")
+        self.selected = self.root
+        self.exploration_weight = config["exploration_weight"]
+        self.thought_history = []; self.debug_history = []; self.surprising_nodes = []
+        self.best_solution = str(self.root.content); self.best_score = 0.0
+        self.iterations_completed = 0; self.simulations_completed = 0; self.high_score_counter = 0
+        self.random_state = random.Random()
+        self.approach_types = ["initial"]; self.explored_approaches = {}; self.explored_thoughts = set(); self.approach_scores = {}
+        self.memory = {"depth": 0, "branches": 0, "high_scoring_nodes": [], "repeated_approaches": []}
+        self.iteration_json_snapshots = []
+        self.thought_history.append(f"# MCTS Analysis for Question: {self.question}\n\nStarting exploration...\n")
+
+    def get_next_sequence(self): self.node_sequence += 1; return self.node_sequence
+    def export_tree_as_json(self): return self.root.node_to_json()
+
+    def get_context_for_node(self, node):
+        # (Robust version from v0.3.2/v0.4.0)
+        best_answer_str = str(self.best_solution) if self.best_solution else "N/A"
+        context = {
+            "best_answer": best_answer_str, "best_score": self.best_score,
+            "current_approach": getattr(node, 'approach_type', 'initial'),
+            "tree_depth": self.memory.get("depth", 0), "branches": self.memory.get("branches", 0),
+            "approach_types": ", ".join(self.approach_types),
+            "explored_approaches": "N/A", "sibling_approaches": "N/A"
+        }
+        try: # Explored approaches context
+            explored_approaches_text = []
+            for approach, thoughts in self.explored_approaches.items():
+                 if thoughts:
+                     avg_score = self.approach_scores.get(approach, "N/A")
+                     score_text = f" (avg score: {avg_score:.1f})" if avg_score != "N/A" else ""
+                     sample = random.sample(thoughts, min(2, len(thoughts)))
+                     # Keep more context here if needed, truncate less
+                     explored_approaches_text.append(f"- {approach}{score_text}: {'; '.join([f'{truncate_text(str(t), 50)}' for t in sample])}")
+            context["explored_approaches"] = "\n".join(explored_approaches_text) if explored_approaches_text else "None yet."
+        except Exception as e: logger.error(f"Ctx err (approaches): {e}")
+        try: # Sibling context
+             if config["sibling_awareness"] and node.parent and node.parent.children:
+                  siblings = [c for c in node.parent.children if c != node];
+                  if siblings:
+                      sibling_approaches = [f'"{truncate_text(str(s.thought), 50)}" (score: {s.value / max(1, s.visits):.1f})' for s in siblings if s.thought and s.visits > 0]
+                      if sibling_approaches: context["sibling_approaches"] = "\n".join(["Siblings:"] + [f"- {sa}" for sa in sibling_approaches])
+        except Exception as e: logger.error(f"Ctx err (siblings): {e}")
+        return context
+
+    def _collect_non_leaf_nodes(self, node, non_leaf_nodes, max_depth, current_depth=0):
+        # (Robust version from v0.3.2/v0.4.0)
+        if current_depth > max_depth: return
+        if node.children and not node.fully_expanded(): non_leaf_nodes.append(node)
+        for child in node.children: self._collect_non_leaf_nodes(child, non_leaf_nodes, max_depth, current_depth + 1)
+
+    async def select(self):
+        # (Robust version from v0.3.2/v0.4.0)
+        logger.debug("Selecting node...")
+        node = self.root; selection_path = [node]; debug_info = "### UCT Selection Path Decisions:\n"
+        # Non-leaf heuristic
+        if (self.simulations_completed > 0 and self.simulations_completed % config['force_exploration_interval'] == 0 and self.memory.get("depth", 0) > 1):
+             candidate_nodes = []; self._collect_non_leaf_nodes(self.root, candidate_nodes, max_depth=max(1, self.memory["depth"]//2))
+             expandable_candidates = [n for n in candidate_nodes if not n.fully_expanded()]
+             if expandable_candidates: node = self.random_state.choice(expandable_candidates); debug_info += f"BRANCH ENHANCE: Node {node.sequence}\n"; return node
+        # Normal UCT
+        while node.children:
+            unvisited = [child for child in node.children if child.visits == 0]
+            if unvisited: node = self.random_state.choice(unvisited); debug_info += f"Unvisited Node {node.sequence}\n"
+            else:
+                valid_children = [child for child in node.children if math.isfinite(child.uct_value())]
+                if not valid_children: logger.warning(f"No valid children for UCT Node {node.sequence}."); node = self.random_state.choice(node.children); break
+                uct_values = sorted([(child, child.uct_value()) for child in valid_children], key=lambda x: x[1], reverse=True)
+                if len(uct_values) > 1 and self.random_state.random() < 0.2: node = uct_values[1][0]; debug_info += f"DIVERSITY BOOST: Node {node.sequence}\n"
+                else: node = uct_values[0][0]; debug_info += f"Best UCT: Node {node.sequence} ({uct_values[0][1]:.3f})\n"
+            selection_path.append(node)
+            if not node.fully_expanded() or not node.children: break
+        path_str = " → ".join([f"Node {n.sequence}" for n in selection_path]); self.thought_history.append(f"### Selection Path\n{path_str}\n")
+        if config["debug_logging"]: self.debug_history.append(debug_info); logger.debug(debug_info)
+        self.memory["depth"] = max(self.memory.get("depth",0), len(selection_path) - 1)
+        return node
+
+    def _classify_approach(self, thought: str) -> Tuple[str, str]:
+        """Classify approach type and family using taxonomy."""
+        # (Robust version from v0.3.2/v0.4.0)
+        approach_type = "variant"; approach_family = "general"; thought_lower = str(thought).lower()
+        approach_scores = {app: sum(1 for kw in kws if kw in thought_lower) for app, kws in approach_taxonomy.items()}
+        positive_scores = {app: score for app, score in approach_scores.items() if score > 0}
+        if positive_scores:
+            max_score = max(positive_scores.values())
+            best_approaches = [app for app, score in positive_scores.items() if score == max_score]
+            approach_type = self.random_state.choice(best_approaches)
+            if approach_type in approach_metadata: approach_family = approach_metadata[approach_type].get("family", "general")
+        logger.debug(f"Classified thought as: {approach_type} (Family: {approach_family})")
+        return approach_type, approach_family
+
+    def _check_surprise(self, parent_node, new_content, new_approach_type, new_approach_family) -> Tuple[bool, str]:
+         """Check for surprise based on multiple factors."""
+         # (Robust version from v0.3.2/v0.4.0)
+         surprise_factors = []; is_surprising = False; surprise_explanation = ""
+         # 1. Semantic Distance
+         if config["use_semantic_distance"]:
+             try:
+                 dist = calculate_semantic_distance(parent_node.content, new_content, self.llm)
+                 if dist > config["surprise_threshold"]: surprise_factors.append({ "type": "semantic", "value": dist, "weight": config["surprise_semantic_weight"], "desc": f"Semantic distance ({dist:.2f}) > {config['surprise_threshold']}"})
+             except Exception as e: logger.warning(f"Semantic dist check failed: {e}")
+         # 2. Philosophical Shift
+         parent_family = getattr(parent_node, 'approach_family', 'general')
+         if parent_family != new_approach_family: surprise_factors.append({ "type": "family_shift", "value": 1.0, "weight": config["surprise_philosophical_shift_weight"], "desc": f"Shift from {parent_family} to {new_approach_family} family"})
+         # 3. Novelty of Family
+         try: # Limit BFS
+             family_counts = {}; queue = [self.root]; nodes_visited = 0; MAX_NOVELTY_CHECK_NODES = 100
+             while queue and nodes_visited < MAX_NOVELTY_CHECK_NODES:
+                 curr = queue.pop(0); nodes_visited +=1
+                 fam = getattr(curr, 'approach_family', 'general'); family_counts[fam] = family_counts.get(fam, 0) + 1
+                 queue.extend(curr.children)
+             if family_counts.get(new_approach_family, 0) <= 1: surprise_factors.append({ "type": "novelty", "value": 0.8, "weight": config["surprise_novelty_weight"], "desc": f"Novel approach family ({new_approach_family})"})
+         except Exception as e: logger.warning(f"Novelty check failed: {e}")
+         # Combine factors
+         if surprise_factors:
+             total_weighted_score = sum(f["value"] * f["weight"] for f in surprise_factors); total_weight = sum(f["weight"] for f in surprise_factors)
+             if total_weight > 0:
+                 combined_score = total_weighted_score / total_weight
+                 if combined_score >= config["surprise_overall_threshold"]:
+                     is_surprising = True; factor_descs = [f"- {f['desc']}" for f in surprise_factors]
+                     surprise_explanation = f"Combined surprise ({combined_score:.2f}):\n" + "\n".join(factor_descs)
+                     logger.debug(f"Surprise DETECTED Node {parent_node.sequence+1}: Score={combined_score:.2f}")
+         return is_surprising, surprise_explanation
+
+    async def expand(self, node) -> Tuple[Optional[Node], bool]:
+        """Expand node, create ONE child. Includes advanced logic."""
+        # (Using robust expand from v0.3.2/v0.4.0)
+        logger.debug(f"Expanding node {node.sequence}...")
+        try:
+            # Emit minimal status update, not the full formatted output
+            await self.llm.progress(f"Expanding Node {node.sequence}...") # Use progress instead of emit_message
+            context = self.get_context_for_node(node)
+            thought = await self.llm.generate_thought(node.content, context)
+            if not isinstance(thought, str) or not thought or "Error:" in thought: raise ValueError(f"Invalid thought: {thought}")
+            thought_entry = f"### Expanding Node {node.sequence}\n... **Thought**: {thought}\n"
+
+            approach_type, approach_family = self._classify_approach(thought) # Classify
+            thought_entry += f"Approach: {approach_type} (Family: {approach_family})\n"
+            # Update memory...
+            self.explored_thoughts.add(thought);
+            if approach_type not in self.approach_types: self.approach_types.append(approach_type)
+            if approach_type not in self.explored_approaches: self.explored_approaches[approach_type] = []
+            self.explored_approaches[approach_type].append(thought)
+
+            new_content = await self.llm.update_approach(node.content, thought, context)
+            if not isinstance(new_content, str) or not new_content or "Error:" in new_content: raise ValueError(f"Invalid new content: {new_content}")
+
+            is_surprising, surprise_explanation = self._check_surprise(node, new_content, approach_type, approach_family)
+            if is_surprising: thought_entry += f"**SURPRISE!**\n{surprise_explanation}\n"
+
+            child = Node(content=new_content, parent=node, sequence=self.get_next_sequence(),
+                         is_surprising=is_surprising, surprise_explanation=surprise_explanation,
+                         approach_type=approach_type, approach_family=approach_family,
+                         thought=thought, generation_context=context)
+            node.add_child(child);
+            if is_surprising: self.surprising_nodes.append(child)
+
+            thought_entry += f"**New solution {child.sequence}**: {truncate_text(new_content, 150)}\n"
+            self.thought_history.append(thought_entry)
+            # Don't emit full formatted output here to reduce noise/rendering load
+            if len(node.children) > 1: self.memory["branches"] = self.memory.get("branches", 0) + 1
+            return child, is_surprising
+        except Exception as e: logger.error(f"Expand err Node {node.sequence}: {e}"); return None, False
+
+
+    async def simulate(self, node):
+        """Simulate and evaluate a node. Handles errors."""
+        # (Using robust simulation logic from v0.3.2/v0.4.0)
+        logger.debug(f"Simulating node {node.sequence}...")
+        score = None # Default
+        try:
+            await self.llm.progress(f"Evaluating node {node.sequence}...")
+            # Don't emit full formatted output here
+            context = self.get_context_for_node(node); eval_type = "absolute"; raw_score = 0
+            node_content = str(node.content) if node.content else ""
+
+            if config["relative_evaluation"] and node.parent:
+                 parent_content = str(node.parent.content) if node.parent.content else ""
+                 relative_score = await self.llm.evaluate_relative(parent_content, node_content, context)
+                 if not isinstance(relative_score, int): raise ValueError("Relative eval failed.")
+                 eval_type = "relative"; raw_score = relative_score
+                 parent_avg_score = node.parent.value / max(1, node.parent.visits)
+                 # Conversion logic...
+                 if relative_score <= 1: score = max(1, round(parent_avg_score - 2))
+                 elif relative_score == 2: score = round(parent_avg_score)
+                 elif relative_score == 3: score = min(10, round(parent_avg_score + 1))
+                 elif relative_score == 4: score = min(10, round(parent_avg_score + 2))
+                 else: score = min(10, round(parent_avg_score + 3))
+                 score = max(1, min(10, score))
+            else: # Absolute eval
+                 score_result = await self.llm.evaluate_answer(node_content, context)
+                 if not isinstance(score_result, int): raise ValueError("Absolute eval failed.")
+                 score = score_result; eval_type = "absolute"; raw_score = score
+
+            # Update stats if score is valid
+            node.raw_scores.append(raw_score); approach = node.approach_type
+            current_avg = self.approach_scores.get(approach, float(score))
+            self.approach_scores[approach] = (0.7 * float(score) + 0.3 * current_avg)
+            if config["debug_logging"]: logger.debug(f"Node {node.sequence} eval: {eval_type}, raw {raw_score}, final {score}")
+            self.thought_history.append(f"### Evaluating Node {node.sequence}\nScore: {score}/10 ({eval_type})\n")
+            # High score memory...
+            if score >= 7:
+                entry = (score, node.content, approach, node.thought)
+                self.memory["high_scoring_nodes"].append(entry)
+                self.memory["high_scoring_nodes"].sort(key=lambda x: x[0], reverse=True)
+                self.memory["high_scoring_nodes"] = self.memory["high_scoring_nodes"][:config["memory_cutoff"]]
+
+        except Exception as e: logger.error(f"Simulate err Node {node.sequence}: {e}"); return None
+        return score
+
+
+    def backpropagate(self, node, score):
+        """Backpropagate score up the tree. Handles None score."""
+        # (Using robust backpropagate from v0.3.2/v0.4.0)
+        if score is None: logger.warning(f"Skip backprop {node.sequence}: Sim failed."); return
+        if not isinstance(score, (int, float)): logger.error(f"Invalid score type {type(score)} Node {node.sequence}. Skip."); return
+        logger.debug(f"Backpropagating score {score} from {node.id}...")
+        backprop_path = []; temp_node = node
+        while temp_node:
+            backprop_path.append(f"Node {temp_node.sequence}")
+            temp_node.visits += 1; temp_node.value += float(score)
+            temp_node = temp_node.parent
+        self.thought_history.append(f"### Backpropagating Score {score}\nPath: {' → '.join(reversed(backprop_path))}\n")
+
+    async def search(self, simulations_per_iteration):
+        """Perform MCTS simulations for one iteration."""
+        # (Using robust search loop from v0.3.2/v0.4.0, reduced output frequency)
+        logger.info(f"Starting Iteration {self.iterations_completed + 1} search ({simulations_per_iteration} sims)...")
+        visited_leaves = {}
+        for i in range(simulations_per_iteration):
+             self.simulations_completed += 1; self.current_simulation_in_iteration = i + 1
+             sim_entry = f"### Iter {self.iterations_completed + 1} - Sim {i+1}/{simulations_per_iteration}\n"
+             self.thought_history.append(sim_entry)
+             leaf = await self.select(); self.selected = leaf
+             node_to_simulate = leaf; score = None
+             if not leaf.fully_expanded():
+                 expansion_result = await self.expand(leaf)
+                 if expansion_result and expansion_result[0]: # Success
+                     new_child, _ = expansion_result
+                     self.selected = new_child; node_to_simulate = new_child
+                     score = await self.simulate(node_to_simulate)
+                 else: score = await self.simulate(leaf); node_to_simulate = leaf # Simulate parent on fail
+             else: score = await self.simulate(leaf); node_to_simulate = leaf
+             self.backpropagate(node_to_simulate, score)
+             # Update Best Solution
+             if score is not None and score > self.best_score:
+                  self.best_score = float(score); self.best_solution = str(node_to_simulate.content)
+                  self.thought_history.append(f"### New Best! Score: {score}/10 Node: {node_to_simulate.sequence}\n")
+                  # **Emit full output ONLY when a new best is found**
+                  await self.llm.emit_message(self.formatted_output(node_to_simulate)) # Pass node that achieved score
+                  # Early stopping logic...
+                  if config["early_stopping"] and score >= config["early_stopping_threshold"]:
+                       self.high_score_counter += 1
+                       if self.high_score_counter >= config["early_stopping_stability"]:
+                            await self.llm.emit_message(f"Early stopping criteria met.")
+                            self._store_iteration_snapshot("Early Stopping")
+                            return self.selected
+                  else: self.high_score_counter = 0
+             else: self.high_score_counter = 0
+             # Periodic Reporting...
+             if i > 0 and i % 5 == 0: await self._report_tree_stats()
+
+        # End of Iteration
+        # **Emit final state for this iteration using emit_message**
+        await self.llm.emit_message(self.formatted_output(self.selected)) # Highlight last selected node
+        self._store_iteration_snapshot("End of Iteration")
+        return self.selected
+
+    def _store_iteration_snapshot(self, reason: str):
+        """Helper to store the JSON snapshot."""
+        try: snapshot = {"iteration": self.iterations_completed + 1, "simulation": self.current_simulation_in_iteration, "reason": reason, "tree_json": self.export_tree_as_json()}; self.iteration_json_snapshots.append(snapshot)
+        except Exception as e: logger.error(f"Snapshot store failed: {e}")
+
+    async def _report_tree_stats(self):
+        """Generate and report statistics about the tree."""
+        try:
+             num_leaves = 0; leaf_nodes = []; self._collect_leaves(self.root, leaf_nodes); num_leaves = len(leaf_nodes)
+             total_nodes = self.node_sequence; max_depth = 0
+             for leaf in leaf_nodes:
+                 depth = 0
+                 node = leaf
+                 while node and node.parent:
+                     depth += 1
+                     node = node.parent
+                 max_depth = max(max_depth, depth)
+             self.memory["depth"] = max_depth; branching_factor = (total_nodes - 1) / max(1, max_depth)
+             stats_msg = f"### Tree Stats: Nodes={total_nodes}, Depth={max_depth}, Leaves={num_leaves}, Avg Branching={branching_factor:.2f}\n"
+             if config["debug_logging"]: self.debug_history.append(stats_msg); logger.debug(stats_msg)
+             self.thought_history.append(f"**Stats:** Nodes: {total_nodes}, Depth: {max_depth}, Leaves: {num_leaves}\n")
+        except Exception as e: logger.error(f"Error reporting tree stats: {e}")
+
+    def _collect_leaves(self, node, leaf_nodes):
+        if not node.children: leaf_nodes.append(node)
+        else:
+            for child in node.children: self._collect_leaves(child, leaf_nodes)
+
+    async def analyze_iteration(self):
+        """Analyze the current iteration using LLM."""
+        # (Using robust analysis call from v0.3.2/v0.4.0)
+        if self.best_solution and self.best_score > 0:
+            context = self.get_context_for_node(self.root)
+            context.update({"best_answer": self.best_solution, "best_score": self.best_score, "question": self.question})
+            safe_context = {k: str(v) if v is not None else "N/A" for k, v in context.items()}
+            for k in ["tree_depth", "branches", "approach_types"]: safe_context.setdefault(k, "N/A")
+            try:
+                 analysis_result = await self.llm.analyze_iteration(safe_context)
+                 if isinstance(analysis_result, str) and analysis_result and "Error:" not in analysis_result:
+                     self.thought_history.append(f"## Iteration Analysis\n{analysis_result}\n")
+            except Exception as e: logger.error(f"Analyze iteration failed: {e}")
+        return None
+
+    # Removed MCTS.mermaid
+
+    def formatted_output(self, highlighted_node=None):
+        """Generate comprehensive output block WITHOUT Mermaid."""
+        try:
+            iter_num = self.iterations_completed + 1; sim_num = self.current_simulation_in_iteration
+            max_sims = config['simulations_per_iteration']
+            result = f"# MCTS Process - Iter {iter_num} / Sim {sim_num}/{max_sims}\n\n" # Contextual title
+
+            # Removed "Current Search Tree" section
+            # result += "## Current Search Tree\n" + self.mermaid(highlighted_node) # Removed
+
+            result += "\n## Thought Process History\n" + "\n".join(self.thought_history[-6:]) # Show more history
+            # Surprising Nodes section...
+            if self.surprising_nodes:
+                 result += "\n## Surprising Nodes Detected\n"
+                 for node in self.surprising_nodes[-3:]: result += f"### Node {node.sequence}: {node.surprise_explanation}\n   Thought: {truncate_text(node.thought)}\n   Content: {truncate_text(node.content, 150)}\n\n"
+            # Best Solution...
+            if self.best_solution: result += f"\n## Best Solution (Score: {self.best_score:.2f}/10)\n{self.best_solution}\n"
+            # Approach Performance...
+            if self.approach_scores:
+                 result += "\n## Approach Performance\n"
+                 sorted_approaches = sorted(self.approach_scores.items(), key=lambda x: x[1], reverse=True)
+                 for approach, score in sorted_approaches[:5]: result += f"- {approach}: avg score {score:.2f} ({len(self.explored_approaches.get(approach, []))} thoughts)\n"
+            # Parameters...
+            result += f"\n## Search Parameters (Current)\n"
+            result += f"- Explore W: {config['exploration_weight']:.2f}, Sims/Iter: {config['simulations_per_iteration']}\n"
+            result += f"- Relative Eval: {config['relative_evaluation']}, Global Context: {config['global_context_in_prompts']}\n"
+            # Debug Info...
+            if config["debug_logging"] and self.debug_history: result += "\n## Debug Log\n" + "\n".join(self.debug_history[-3:])
+            return result
+        except Exception as e: logger.error(f"Error formatting output: {e}"); return f"Error: {e}"
+
+# ==============================================================================
+
+class Pipe:
+    """Interface with Open WebUI."""
+    # Valves Definition (Removed NODE_LABEL_LENGTH)
+    class Valves(BaseModel):
+        MAX_ITERATIONS: int = Field(default=config["max_iterations"], title="Max Iterations")
+        SIMULATIONS_PER_ITERATION: int = Field(default=config["simulations_per_iteration"], title="Simulations / Iteration")
+        MAX_CHILDREN: int = Field(default=config["max_children"], title="Max Children / Node")
+        EXPLORATION_WEIGHT: float = Field(default=config["exploration_weight"], title="Exploration Weight")
+        SURPRISE_THRESHOLD: float = Field(default=config["surprise_threshold"], ge=0.0, le=1.0, title="Surprise Threshold (Semantic)")
+        USE_SEMANTIC_DISTANCE: bool = Field(default=config["use_semantic_distance"], title="Use Semantic Distance")
+        # NODE_LABEL_LENGTH: int = Field(default=config["node_label_length"], title="Node Label Length") # Removed
+        RELATIVE_EVALUATION: bool = Field(default=config["relative_evaluation"], title="Relative Evaluation")
+        SCORE_DIVERSITY_BONUS: float = Field(default=config["score_diversity_bonus"], title="Score Diversity Bonus")
+        FORCE_EXPLORATION_INTERVAL: int = Field(default=config["force_exploration_interval"], title="Force Exploration Interval")
+        DEBUG_LOGGING: bool = Field(default=config["debug_logging"], title="Enable Debug Logging")
+        GLOBAL_CONTEXT_IN_PROMPTS: bool = Field(default=config["global_context_in_prompts"], title="Use Global Context")
+        TRACK_EXPLORED_APPROACHES: bool = Field(default=config["track_explored_approaches"], title="Track Approaches")
+        SIBLING_AWARENESS: bool = Field(default=config["sibling_awareness"], title="Sibling Awareness")
+        MEMORY_CUTOFF: int = Field(default=config["memory_cutoff"], title="Memory Cutoff (Top N)")
+        EARLY_STOPPING: bool = Field(default=config["early_stopping"], title="Enable Early Stopping")
+        EARLY_STOPPING_THRESHOLD: float = Field(default=config["early_stopping_threshold"], title="Early Stopping Score Threshold")
+        EARLY_STOPPING_STABILITY: int = Field(default=config["early_stopping_stability"], title="Early Stopping Stability")
+        SURPRISE_SEMANTIC_WEIGHT: float = Field(default=config["surprise_semantic_weight"], title="Surprise: Semantic Weight")
+        SURPRISE_PHILOSOPHICAL_SHIFT_WEIGHT: float = Field(default=config["surprise_philosophical_shift_weight"], title="Surprise: Shift Weight")
+        SURPRISE_NOVELTY_WEIGHT: float = Field(default=config["surprise_novelty_weight"], title="Surprise: Novelty Weight")
+        SURPRISE_OVERALL_THRESHOLD: float = Field(default=config["surprise_overall_threshold"], ge=0.0, le=1.0, title="Surprise: Overall Threshold")
+
+
+    def __init__(self):
+        self.type = "manifold"; self.__current_event_emitter__ = None; self.__question__ = ""; self.__model__ = ""
+
+    # (pipes, resolve_model, resolve_question - robust versions)
+    def pipes(self) -> list[dict[str, str]]:
+        try: ollama.get_all_models(); models = app.state.OLLAMA_MODELS; return [{"id": f"{name}-{k}", "name": f"{name} {models[k]['name']}"} for k in models if k != "manifest.json"]
+        except Exception as e: logger.error(f"Pipe list failed: {e}"); return []
+    def resolve_model(self, body: dict) -> str:
+        model_id = body.get("model", ""); wp = ".".join(model_id.split(".")[1:]); return wp.replace(f"{name}-", "")
+    def resolve_question(self, body: dict) -> str:
+        msgs = body.get("messages", []); return msgs[-1].get("content", "").strip() if msgs else ""
+
+    async def pipe(self, body: dict, __user__: dict, __event_emitter__: Callable[[dict], Awaitable[None]] = None, __task__=None, __model__=None) -> str | Generator | Iterator:
+        """Main entry point for processing requests."""
+        try:
+            # Setup phase
+            model = self.resolve_model(body); base_question = self.resolve_question(body)
+            if not base_question: raise ValueError("No question provided.")
+            self.__current_event_emitter__ = __event_emitter__; self.__model__ = model; self.__question__ = base_question
+            logger.info(f"Pipe {name} v0.5.0 starting. Model: {model}, Q: {truncate_text(base_question)}")
+        
+            if __task__ == TASKS.TITLE_GENERATION:
+                    content = await self.get_completion(model, body.get("messages", [])); return f"{name}: {str(content)}"
+
+            # Apply valve settings / Handle defaults
+            if hasattr(self, "valves") and self.valves:
+                 logger.info(f"Applying Valve settings...")
+                 try: # Apply all defined valves
+                     for key, value in self.valves.model_dump().items():
+                         config_key = key.lower()
+                         if config_key in config: config[config_key] = value
+                 except Exception as e: logger.error(f"Valve apply error: {e}. Using defaults.")
+            else: logger.warning("No valves found/applied, using hardcoded defaults.")
+            # Ensure critical defaults are set
+            config["exploration_weight"] = config.get("exploration_weight", 2.5)
+            config["simulations_per_iteration"] = config.get("simulations_per_iteration", 15)
+            setup_logger() # Update logger level
+
+            # Introduction messages
+            await self.emit_message(f"# Advanced MCTS v0.5.0 (No Viz)\n**Model:** {model}\n**Question:** {base_question}\n")
+            await self.emit_message("## Search Parameters (Current Run)\n```json\n" + json.dumps({k:v for k,v in config.items() if k not in ['thoughts_per_node', 'node_label_length']}, indent=2) + "\n```\n") # Show relevant params
+
+            # Initial Answer
+            await self.progress("Generating initial answer...")
+            initial_reply = await self.stream_prompt_completion(initial_prompt, question=base_question) # Use base_question
+            if not isinstance(initial_reply, str) or "Error:" in initial_reply: raise ValueError(f"Failed initial reply: {initial_reply}")
+            await self.emit_message("\n## Initial Answer:\n" + initial_reply + "\n")
+
+            # MCTS Init
+            root = Node(content=initial_reply); mcts = MCTS(root=root, llm=self, question=base_question)
+            # No initial visualization to emit
+
+            # MCTS Main Loop
+            logger.info("Starting MCTS iterations...")
+            final_best_solution = initial_reply
+            for i in range(config["max_iterations"]):
+                 logger.info(f"Starting Iteration {i + 1}/{config['max_iterations']}...")
+                 await self.emit_message(f"\n## Iteration {i + 1}/{config['max_iterations']}\n")
+                 # Search returns the last selected node, but we track best solution internally
+                 await mcts.search(config["simulations_per_iteration"])
+                 mcts.iterations_completed += 1
+                 await self.emit_message(f"Completed Iteration {i+1}. Best score: {mcts.best_score:.2f}/10\n")
+                 # Early stopping check...
+                 if mcts.high_score_counter >= config["early_stopping_stability"] and config["early_stopping"]:
+                      logger.info(f"Early stopping after iteration {i+1}."); await self.emit_message("Early stopping criteria met."); break
+            final_best_solution = mcts.best_solution if isinstance(mcts.best_solution, str) else initial_reply
+
+            # Final Output section
+            await self.emit_message("\n\n## Final Answer:\n")
+            await self.emit_message(f"{str(final_best_solution)}\n")
+            # Approach summary...
+            if mcts.approach_scores:
+                 await self.emit_message("## Approach Performance Summary\n")
+                 sorted_approaches = sorted(mcts.approach_scores.items(), key=lambda x: x[1], reverse=True)
+                 for rank, (app, score) in enumerate(sorted_approaches):
+                     count = len(mcts.explored_approaches.get(app, []))
+                     await self.emit_message(f"{rank+1}. **{app}**: avg score {score:.2f} ({count} thoughts)\n")
+                     if app in mcts.explored_approaches and mcts.explored_approaches[app]:
+                          sample = random.choice(mcts.explored_approaches[app]); await self.emit_message(f'   Sample: "{truncate_text(str(sample), 80)}"\n')
+            # JSON Snapshots...
+            await self.emit_message("\n\n## Per-Iteration Tree JSON Snapshots\n")
+            if mcts.iteration_json_snapshots:
+                 for snapshot in mcts.iteration_json_snapshots:
+                     await self.emit_message(f"### Iter {snapshot['iteration']} ({snapshot['reason']})\n")
+                     # Use json.dumps for proper formatting
+                     await self.emit_message(f"```json\n{json.dumps(snapshot['tree_json'], indent=2)}\n```\n")
+            else: await self.emit_message("No snapshots recorded.\n")
+
+            # Termination
+            await self.done()
+            logger.info(f"Pipe {name} finished successfully.")
+            return str(final_best_solution)
+
+        except Exception as e: # Catch all exceptions
+             logger.error(f"FATAL Error in pipe execution: {e}", exc_info=True)
+             try: await self.emit_message(f"\n\n**FATAL ERROR:**\n```\n{str(e)}\n```\nPipe stopped."); await self.done()
+             except: pass
+             return f"Error: Pipe failed. {str(e)}"
+
+
+    # --- LLM Interaction & Helper Methods (Robust versions from v0.3.4) ---
+    async def progress(self, message: str):
+        if self.__current_event_emitter__:
+            try: await self.__current_event_emitter__({"type": "status", "data": {"level": "info", "description": str(message), "done": False}})
+            except Exception as e: logger.error(f"Emit progress error: {e}")
+    async def done(self):
+        if self.__current_event_emitter__:
+            try: await self.__current_event_emitter__({"type": "status", "data": {"level": "info", "description": "Fin.", "done": True}})
+            except Exception as e: logger.error(f"Emit done error: {e}")
+    async def emit_message(self, message: str):
+        if self.__current_event_emitter__:
+            try: await self.__current_event_emitter__({"type": "message", "data": {"content": str(message)}})
+            except Exception as e: logger.error(f"Emit message error: {e}")
+    async def emit_replace(self, message: str): # Keep stub
+        # This might be useful for status updates in the future
+        if self.__current_event_emitter__:
+            try: await self.__current_event_emitter__({"type": "replace", "data": {"content": str(message)}})
+            except Exception as e: logger.error(f"Emit replace error: {e}")
+
+    async def get_streaming_completion(self, model: str, messages) -> AsyncGenerator[str, None]:
+         response = await self.call_ollama_endpoint_function({"model": model, "messages": messages, "stream": True})
+         if isinstance(response, dict) and response.get("choices") and "Error:" in response["choices"][0].get("message", {}).get("content", ""):
+              err_msg = response["choices"][0]['message']['content']; logger.error(f"LLM call failed before streaming: {err_msg}"); yield err_msg; return
+         try:
+             if hasattr(response, 'body_iterator'):
+                 async for chunk in response.body_iterator:
+                     for part in self.get_chunk_content(chunk): yield part
+             else: logger.error(f"Expected StreamingResponse, got {type(response)}."); yield "Error: Invalid LLM response type."
+         except Exception as e: logger.error(f"LLM stream iteration error: {e}"); yield f"Error: {e}"
+    async def get_message_completion(self, model: str, content):
+         try:
+             async for chunk in self.get_streaming_completion(model, [{"role": "user", "content": str(content)}]): yield chunk
+         except Exception as e: logger.error(f"Error in get_message_completion: {e}"); yield f"Error: {e}"
+    async def get_completion(self, model: str, messages):
+         response = await self.call_ollama_endpoint_function({"model": model, "messages": messages, "stream": False})
+         return self.get_response_content(response)
+
+    async def call_ollama_endpoint_function(self, payload):
+        async def receive(): return {"type": "http.request", "body": json.dumps(payload).encode("utf-8")}
+        mock_request = Request(scope={"type": "http","headers": [],"method": "POST","scheme": "http","server": ("l", 80),"path": "/v1/c/c","query_string": b"","client": ("1", 80),"app": app}, receive=receive)
+        try:
+            response = await ollama.generate_openai_chat_completion(request=mock_request, form_data=payload, user=admin)
+            return response
+        except Exception as e:
+            logger.error(f"Ollama API call error: {str(e)}", exc_info=config.get("debug_logging", False))
+            return {"choices": [{"message": {"content": f"Error: LLM call failed ({str(e)[:100]}...). See logs."}}]}
+
+    async def stream_prompt_completion(self, prompt, **format_args):
+         complete = ""; safe_format_args = {k: str(v) if v is not None else "" for k, v in format_args.items()}
+         try: formatted_prompt = prompt.format(**safe_format_args)
+         except KeyError as e: logger.error(f"Prompt format err key '{e}' - Args: {list(safe_format_args.keys())}"); return f"Error: Prompt format ({e})."
+         except Exception as e: logger.error(f"Prompt format err: {e}"); return f"Error: Prompt format ({e})."
+         try:
+             error_occurred = False
+             async for chunk in self.get_message_completion(self.__model__, formatted_prompt):
+                 if chunk is not None:
+                     chunk_str = str(chunk)
+                     if chunk_str.startswith("Error:"): logger.error(f"LLM stream yielded error: {chunk_str}"); complete = chunk_str; error_occurred = True; break
+                     complete += chunk_str
+             if error_occurred: return complete
+             return complete if complete is not None else ""
+         except Exception as e: logger.error(f"LLM stream err: {e}"); return f"Error: LLM stream ({e})."
+
+    # (generate_thought, evaluate_answer, evaluate_relative, analyze_iteration, update_approach - robust versions)
+    async def generate_thought(self, answer, context=None):
+        format_args = {"answer": str(answer), "question": str(self.__question__)}
+        prompt_to_use = thoughts_prompt
+        if context and config["global_context_in_prompts"]: format_args.update({ k: str(v) if v is not None else "N/A" for k, v in context.items() if k in ["best_answer", "best_score", "explored_approaches", "current_approach"]})
+        else: prompt_to_use = thoughts_prompt.split("<context>")[0] + thoughts_prompt.split("</context>")[1]
+        result = await self.stream_prompt_completion(prompt_to_use, **format_args)
+        return result if isinstance(result, str) and "Error:" not in result else ""
+    async def evaluate_answer(self, answer, context=None):
+        format_args = {"answer": str(answer), "question": str(self.__question__)}
+        prompt_to_use = eval_answer_prompt
+        if context and config["global_context_in_prompts"]: format_args.update({k: str(v) if v is not None else "N/A" for k, v in context.items() if k in ["best_answer", "best_score"]})
+        else: prompt_to_use = eval_answer_prompt.split("<context>")[0] + eval_answer_prompt.split("</context>")[1]
+        result = await self.stream_prompt_completion(prompt_to_use, **format_args)
+        if not isinstance(result, str) or "Error:" in result: return 0
+        score_match = re.search(r'\b([1-9]|10)\b', result.strip()); return int(score_match.group(1)) if score_match else 0
+    async def evaluate_relative(self, parent_answer, answer, context=None):
+         format_args = {"parent_answer": str(parent_answer), "answer": str(answer), "question": str(self.__question__)}
+         prompt_to_use = relative_eval_prompt
+         if context and config["global_context_in_prompts"]: format_args.update({k: str(v) if v is not None else "N/A" for k, v in context.items() if k in ["best_answer", "best_score"]})
+         else: prompt_to_use = relative_eval_prompt.split("<context>")[0] + relative_eval_prompt.split("</context>")[1]
+         result = await self.stream_prompt_completion(prompt_to_use, **format_args)
+         if not isinstance(result, str) or "Error:" in result: return 3
+         score_match = re.search(r'\b[1-5]\b', result.strip()); return max(1, min(5, int(score_match.group(0)))) if score_match else 3
+    async def analyze_iteration(self, context):
+         if not context: return "Error: Missing context."
+         safe_context = {k: str(v) if v is not None else "N/A" for k, v in context.items()}
+         for k in ["question", "best_answer", "best_score", "tree_depth", "branches", "approach_types"]: safe_context.setdefault(k, "N/A")
+         safe_context["question"]= str(self.__question__)
+         result = await self.stream_prompt_completion(analyze_prompt, **safe_context)
+         return result if isinstance(result, str) and "Error:" not in result else "Error during analysis."
+    async def update_approach(self, answer, improvements, context=None):
+         if not isinstance(improvements, str) or not improvements: return str(answer)
+         format_args = {"answer": str(answer), "improvements": improvements, "question": str(self.__question__)}
+         prompt_to_use = update_prompt
+         if context and config["global_context_in_prompts"]: format_args.update({k: str(v) if v is not None else "N/A" for k, v in context.items() if k in ["best_answer", "best_score", "explored_approaches", "current_approach"]})
+         else: prompt_to_use = update_prompt.split("<context>")[0] + update_prompt.split("</context>")[1]
+         result = await self.stream_prompt_completion(prompt_to_use, **format_args)
+         return result if isinstance(result, str) and "Error:" not in result else str(answer)
+
+    # (get_response_content - robust version)
+    def get_response_content(self, response):
+        # (Using robust version from v0.3.4)
+        try:
+            if isinstance(response, dict) and "choices" in response and isinstance(response["choices"], list) and response["choices"]:
+                 message = response["choices"][0].get("message", {})
+                 if isinstance(message, dict): content = message.get("content"); return str(content) if content is not None else ""
+            logger.warning(f"Unexpected response structure: {str(response)[:200]}...")
+            return ""
+        except Exception as e: logger.error(f'ResponseError: {str(e)}'); return ""
+
+    # (get_chunk_content - robust version)
+    def get_chunk_content(self, chunk):
+        # (Using robust version from v0.3.4)
+        try:
+            chunk_str = chunk.decode("utf-8")
+            if chunk_str.startswith("data: "): chunk_str = chunk_str[6:]
+            chunk_str = chunk_str.strip()
+            if not chunk_str or chunk_str == "[DONE]": return
+            try: # Attempt JSON
+                chunk_data = json.loads(chunk_str)
+                if isinstance(chunk_data, dict) and "choices" in chunk_data and chunk_data["choices"]:
+                    delta = chunk_data["choices"][0].get("delta", {})
+                    content = delta.get("content")
+                    if content: yield str(content) # Ensure string
+            except json.JSONDecodeError: # If not JSON, treat as text if reasonable
+                 logger.debug(f"Chunk not JSON: {chunk_str[:100]}")
+                 if not chunk_str.startswith(("{", "[")): yield chunk_str
+            except Exception as e: logger.error(f"Err processing JSON chunk: {e}")
+        except UnicodeDecodeError: logger.error(f"ChunkDecodeError: unable to decode.")
+        except Exception as e: logger.error(f"Err processing raw chunk: {e}")
+
+# ==============================================================================
+# FILE END
+# ==============================================================================
