@@ -126,7 +126,7 @@ The agent's behavior can be significantly customized through the `Valves` settin
     *   **Final Synthesis:** A concluding paragraph summarizing the thought process.
 *   **Return Value:** The raw text of the single best analysis found.
 
-## Requirements
+## Requirements (Pre-installed in openweb-ui- so just what is in it)
 
 *   Python 3.x
 *   OpenWebUI
