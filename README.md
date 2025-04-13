@@ -8,8 +8,9 @@ https://docs.openwebui.com/
 
 **Authors:**
 *   angrysky56 ([GitHub](https://github.com/angrysky56))
-*   ChatGPT
-*   Claude
+*   Gemini 2.5 pro preview 03.25 
+*   Claude 4.7
+*   ChatGPT 4.5
 
 ## Overview
 
