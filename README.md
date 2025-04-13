@@ -138,7 +138,7 @@ The agent's behavior can be significantly customized through the `Valves` settin
 
 ## Usage
 
-Integrate this script as a "Pipe" within an OpenWebUI instance. (Go to settings in the bottom left, select admin, functions at the top, select the function) Select the pipe model version in the models dropdown (e.g., "advanced_mcts (your_model_name)") when interacting with a model. Configure parameters using the "Valves" options in the chat settings.
+Integrate this script as a "Pipe" within an OpenWebUI instance. (Go to the user name in the bottom left, select admin then select functions at the top, select the function) Select the pipe model version in the models dropdown (e.g., "advanced_mcts (your_model_name)") when interacting with a model. Configure parameters using the "Valves" options in the chat settings.
 
 ## Example output- still a bit glitchy and erases the first part- working on it!
 
