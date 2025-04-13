@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 title: advanced_bayesian_mcts
-version: 0.7.19
+version: 0.7.18
 
 author: angrysky56
 author_url: https://github.com/angrysky56
@@ -15,10 +15,10 @@ DATA_DIR=~/.open-webui uvx --python 3.11 open-webui@latest serve
 http://localhost:8080
 
 description: >
-  Advanced Bayesian MCTS v0.7.19: Adds Iteration Summaries to chat history. Live view still shows
+  Advanced Bayesian MCTS v0.7.18: Adds Iteration Summaries to chat history. Live view still shows
   thoughts for expansions. Final summary includes full thoughts for top nodes & synthesis.
 
-Key improvements in v0.7.19:
+Key improvements in v0.7.18:
 - Iteration Summaries: After each iteration (group of simulations), a summary message is posted
   to the chat, showing progress and the current best score. This persists across iterations.
 - Live View Focus: Continues showing thoughts for expansions, hides most analysis text during run.
