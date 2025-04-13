@@ -7,7 +7,10 @@ author: angrysky56
 author_url: https://github.com/angrysky56
 Project Link: https://github.com/angrysky56/Bayesian_MCTS_Agent
 
-Where I found my stored functions, replace ty with your user name:
+openweb-ui function link:
+https://openwebui.com/f/angrysky56/advanced_bayesian_mcts_v0719
+
+Just FYI- Where I found my stored functions, replace ty with your user name:
 /home/ty/.open-webui/cache/functions
 
 The way I launch openweb-ui:
