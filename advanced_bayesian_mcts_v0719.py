@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 title: advanced_bayesian_mcts
+version: 0.7.19
+
 author: angrysky56
 author_url: https://github.com/angrysky56
+Project Link: https://github.com/angrysky56/Bayesian_MCTS_Agent
+
+The way I launch openweb-ui:
+DATA_DIR=~/.open-webui uvx --python 3.11 open-webui@latest serve
+http://localhost:8080
+
 description: >
   Advanced Bayesian MCTS v0.7.19: Adds Iteration Summaries to chat history. Live view still shows
   thoughts for expansions. Final summary includes full thoughts for top nodes & synthesis.
-version: 0.7.19
 
 Key improvements in v0.7.19:
 - Iteration Summaries: After each iteration (group of simulations), a summary message is posted
@@ -14,13 +21,13 @@ Key improvements in v0.7.19:
 - Live View Focus: Continues showing thoughts for expansions, hides most analysis text during run.
 - Final Summary Clarity: Shows full thoughts for top nodes, no analysis snippets there. Includes synthesis.
 - Maintained features: Strict prompts, robustness fixes, full best analysis display, scoring tweak.
+# ... previous versions ...
 
 Key improvements in v0.7.18:
 - Live View Focus: Shows driving thoughts for expansions, hides redundant analysis.
 - Final Summary Clarity: "Top Performing Nodes" shows full 'thought' but no analysis snippet.
 - Final Synthesis: Added concluding step synthesizing the best path's thoughts.
 
-# ... previous versions ...
 """
 
 from fastapi import Request, Response
