@@ -3,6 +3,7 @@ Adaptive Advanced Tree Search function designed for OpenWeb-UI
 https://docs.openwebui.com/
 
 # Advanced Bayesian MCTS Agent for OpenWebUI
+![image](https://github.com/user-attachments/assets/1452634e-464a-4f24-9976-f2aa7f6aeafc)
 
 **Version:** 0.7.19
 
