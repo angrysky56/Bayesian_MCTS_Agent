@@ -14,7 +14,7 @@ The way I launch openweb-ui:
 DATA_DIR=~/.open-webui uvx --python 3.11 open-webui@latest serve
 http://localhost:8080
 
-
+The Database feature is-> Currently not working, so the path is moot below. Sorry code is a mess, not a coder, good results on one single run, loses track on the 2nd.
 **How to Use and Test:**
 
 1.  **Save:** Save this code as a Python file (e.g., `advanced_mcts_stateful_pipe.py`) in the Admin panel accesed from your user name in the bottom left, then top- functions tab, where Open WebUI loads custom pipes/functions from.
